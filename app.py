@@ -1,6 +1,6 @@
 """
 app.py  -  Battery Diagnostic Module
-SOH 측정 + 겨울철 방전 위험 예측
+SOH 측정 + 겨울철 방전 위험 예측 + RUL / Knee 분석
 
 실행: D:/python3.12/python -m streamlit run app.py
 """
@@ -12,15 +12,19 @@ import pandas as pd
 import torch
 import joblib
 import streamlit as st
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pinn_model import SOHCurvePINN
+from pinn_model import SOHCurvePINN, RULPredictor
+from knee_detector import KneeDetector
 
 ROOT             = os.path.dirname(os.path.abspath(__file__))
 MODEL_UNIVERSAL  = os.path.join(ROOT, "models", "soh_universal_model.pth")   # 100->60% 전체
 MODEL_SEGMENT    = os.path.join(ROOT, "models", "soh_segment_model.pth")     # 임의 10% 구간
 MODEL_PARKING    = os.path.join(ROOT, "models", "parking_model.pkl")
+MODEL_RUL        = os.path.join(ROOT, "models", "rul_model.pth")
 CUTOFF_V         = 2.5
+EOL_SOH          = 80.0   # RUL 기준 SOH (%)
 
 
 # ── 모델 로드 ─────────────────────────────────────────────────────────────────
@@ -44,6 +48,14 @@ def load_segment_model():
 @st.cache_resource
 def load_parking_model():
     return joblib.load(MODEL_PARKING)
+
+@st.cache_resource
+def load_rul_model():
+    ckpt  = torch.load(MODEL_RUL, weights_only=False, map_location="cpu")
+    model = RULPredictor(n_features=3, rul_max=ckpt["rul_max"])
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model, ckpt["scaler"], ckpt["rul_max"]
 
 
 # ── 예측 함수 ─────────────────────────────────────────────────────────────────
@@ -69,6 +81,14 @@ def predict_soh_segment(cap_ah, dv_dah, soc_hi, soc_lo, rated_cap):
         dv_dah * rated_cap,
         soc_mid,
     ]], dtype=np.float32)
+    x_n = scaler.transform(x).astype(np.float32)
+    with torch.no_grad():
+        return float(model(torch.tensor(x_n)).item())
+
+
+def predict_rul(soh_pct, rate, post_knee_flag):
+    model, scaler, rul_max = load_rul_model()
+    x   = np.array([[soh_pct, rate, float(post_knee_flag)]], dtype=np.float32)
     x_n = scaler.transform(x).astype(np.float32)
     with torch.no_grad():
         return float(model(torch.tensor(x_n)).item())
@@ -183,7 +203,12 @@ st.set_page_config(page_title="Battery Diagnostic Module", page_icon="🔋", lay
 st.title("🔋 Battery Diagnostic Module")
 st.caption("Universal SOH measurement & Cold-weather discharge prevention")
 
-tab1, tab2, tab3 = st.tabs(["SOH — Full Cycle", "SOH — Quick Segment", "Cold Weather Risk"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "SOH — Full Cycle",
+    "SOH — Quick Segment",
+    "Cold Weather Risk",
+    "Lifetime Tracking",
+])
 
 
 # ════════════════════════════════════════════════════════════
@@ -409,3 +434,171 @@ with tab3:
             st.error(f"Error: {e}")
 
     st.caption("Valid: SOC 40-100% | Temp -20~0°C | Park 0-48h | PyBaMM NMC simulation")
+
+
+# ════════════════════════════════════════════════════════════
+# TAB 4 : Lifetime Tracking — Knee + RUL
+# ════════════════════════════════════════════════════════════
+with tab4:
+    st.subheader("Lifetime Tracking — Knee Detection & RUL")
+    st.caption(
+        "SOH 측정 히스토리를 입력하면 Knee 감지 + 남은 수명(RUL) 예측  |  "
+        "EOL 기준: SOH 80%  |  RUL MAE ~7 cycles"
+    )
+
+    with st.expander("Knee란?", expanded=False):
+        st.markdown("""
+**Knee** = 배터리 열화 곡선의 변곡점.
+
+- **Knee 이전**: SEI 성장 지배 → 완만한 선형 열화
+- **Knee 이후**: 리튬 플레이팅 시작 → 급속 열화 (양성 피드백 루프)
+
+Knee를 넘은 배터리는 같은 SOH여도 잔여 수명이 훨씬 짧다.
+
+| 상태 | 의미 |
+|---|---|
+| SOH > 80%, Knee 없음 | 정상 |
+| SOH 60~80%, Knee 없음 | 2nd-life 재활용 가능 |
+| Knee 감지됨 | 급속 열화 진입, 즉시 교체 검토 |
+        """)
+
+    st.divider()
+    input_mode = st.radio(
+        "SOH 히스토리 입력 방법",
+        ["직접 입력 (쉼표 구분)", "CSV 업로드"],
+        horizontal=True,
+        key="rul_mode",
+    )
+
+    soh_list = []
+
+    if input_mode == "직접 입력 (쉼표 구분)":
+        st.markdown("측정 순서대로 SOH (%) 입력  예) `92.1, 91.3, 90.5, 89.2, ...`")
+        raw = st.text_area("SOH 히스토리", value="", height=80, key="rul_text",
+                           placeholder="92.1, 91.3, 90.5, 89.2, 88.1, 87.0, 85.8, 84.3, 82.9, 81.2, 79.5, 78.0")
+        if raw.strip():
+            try:
+                soh_list = [float(v.strip()) for v in raw.replace("\n", ",").split(",") if v.strip()]
+            except ValueError:
+                st.error("숫자만 입력하세요.")
+    else:
+        st.markdown("필수 컬럼: `soh` (%)  옵션: `cycle` (사이클 번호)")
+        up_r = st.file_uploader("CSV 업로드", type=["csv"], key="up_rul")
+        if up_r:
+            df_r = pd.read_csv(up_r)
+            if "soh" not in df_r.columns:
+                st.error("'soh' 컬럼이 없습니다.")
+            else:
+                soh_list = df_r["soh"].dropna().tolist()
+                st.dataframe(df_r.head(5), use_container_width=True)
+
+    if len(soh_list) < 5:
+        st.info("최소 5회 이상의 SOH 측정값이 필요합니다.")
+    else:
+        # Knee 감지
+        kd = KneeDetector.from_list(soh_list)
+        info = kd.summary()
+        rate      = info["rate_%/cyc"]
+        post_knee = info["post_knee_flag"]
+
+        st.divider()
+
+        # ── 메트릭 ─────────────────────────────────────────────
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("측정 사이클 수", f"{info['n_cycles']}")
+        m2.metric("현재 SOH", f"{info['current_soh']:.1f}%")
+        m3.metric("열화 속도", f"{rate:.3f} %/cycle")
+        if info["knee_detected"]:
+            m4.metric("Knee", f"감지 (cycle {info['knee_cycle']})",
+                      delta=f"{info['cycles_since_knee']} cycles 전", delta_color="inverse")
+        else:
+            m4.metric("Knee", "미감지")
+
+        # ── RUL 예측 ───────────────────────────────────────────
+        current_soh = info["current_soh"]
+        if current_soh < EOL_SOH:
+            rul_cycles = 0
+            st.warning(f"SOH가 이미 EOL 기준({EOL_SOH}%) 이하입니다. RUL = 0")
+        else:
+            rul_cycles = predict_rul(current_soh, rate, post_knee)
+            rul_cycles = max(0.0, rul_cycles)
+
+        c_rul1, c_rul2 = st.columns(2)
+        c_rul1.metric("예상 잔여 수명 (RUL)", f"약 {rul_cycles:.0f} 사이클",
+                      help="SOH 80% 도달까지 남은 방전 사이클 수 (MAE ~7 cycles)")
+
+        # 권고 판정
+        if info["knee_detected"]:
+            rec_label  = "즉시 교체 권고"
+            rec_color  = "error"
+            rec_detail = (f"Knee 감지 (cycle {info['knee_cycle']}) — 급속 열화 진입. "
+                          f"재활용 가치 낮음, 폐기 검토.")
+        elif current_soh < EOL_SOH:
+            rec_label  = "교체 필요"
+            rec_color  = "error"
+            rec_detail = f"SOH {current_soh:.1f}% — EOL({EOL_SOH}%) 도달."
+        elif current_soh < 85 and rul_cycles < 15:
+            rec_label  = "교체 임박"
+            rec_color  = "warning"
+            rec_detail = f"잔여 수명 약 {rul_cycles:.0f} 사이클. 조기 교체 준비 권장."
+        elif current_soh < EOL_SOH + 10:
+            rec_label  = "2nd-life 재활용 검토"
+            rec_color  = "warning"
+            rec_detail = "SOH 60~80% 구간 — 정지형 ESS 등 2nd-life 배터리로 재활용 가능."
+        else:
+            rec_label  = "정상"
+            rec_color  = "success"
+            rec_detail = f"SOH {current_soh:.1f}% — Knee 없음, 정상 운용 중."
+
+        c_rul2.metric("판정", rec_label)
+
+        if rec_color == "error":
+            st.error(rec_detail)
+        elif rec_color == "warning":
+            st.warning(rec_detail)
+        else:
+            st.success(rec_detail)
+
+        # ── SOH 히스토리 + RUL 예상 궤적 차트 ────────────────────
+        st.divider()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        fig.suptitle("Battery Lifetime Analysis", fontsize=12)
+
+        cycs = np.arange(len(soh_list))
+
+        # SOH history
+        axes[0].plot(cycs, soh_list, "b-o", ms=3, lw=1.5, label="SOH history")
+        axes[0].axhline(EOL_SOH, color="red",    linestyle="--", alpha=0.7, label=f"EOL ({EOL_SOH}%)")
+        axes[0].axhline(85,      color="orange",  linestyle="--", alpha=0.5, label="Warning (85%)")
+        if info["knee_detected"]:
+            axes[0].axvline(info["knee_cycle"], color="purple", linestyle=":",
+                            lw=1.5, label=f"Knee (cycle {info['knee_cycle']})")
+        axes[0].set_xlabel("Cycle"); axes[0].set_ylabel("SOH (%)")
+        axes[0].set_title("SOH History"); axes[0].legend(fontsize=8)
+        axes[0].grid(True, alpha=0.3)
+
+        # RUL projection
+        proj_cycs = np.arange(0, max(int(rul_cycles) + 10, 20))
+        proj_soh  = current_soh + rate * proj_cycs
+        proj_soh  = np.clip(proj_soh, 0, 100)
+        axes[1].plot(len(soh_list) - 1 + proj_cycs, proj_soh,
+                     "r--", lw=1.5, label="Projected (linear)")
+        axes[1].plot(cycs, soh_list, "b-", lw=1.5, label="History")
+        axes[1].axhline(EOL_SOH, color="red", linestyle="--", alpha=0.7,
+                        label=f"EOL ({EOL_SOH}%)")
+        if rul_cycles > 0:
+            eol_x = len(soh_list) - 1 + rul_cycles
+            axes[1].axvline(eol_x, color="red", linestyle=":", alpha=0.6,
+                            label=f"~EOL cycle {eol_x:.0f}")
+        axes[1].set_xlabel("Cycle"); axes[1].set_ylabel("SOH (%)")
+        axes[1].set_title(f"RUL Projection  (RUL~{rul_cycles:.0f} cycles)")
+        axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close(fig)
+
+        st.caption(
+            "RUL: NASA B0005/B0006/B0007 학습, B0018 검증 (Leave-One-Out)  |  "
+            "MAE ~7 cycles  |  Knee: 2차 미분 알고리즘 (ML 불필요)"
+        )
