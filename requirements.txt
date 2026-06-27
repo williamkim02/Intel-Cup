@@ -1,6 +1,10 @@
-streamlit>=1.30.0
-torch>=2.0.0
-numpy>=1.24.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
-joblib>=1.3.0
+# Dependencies for the SOH model benchmark (benchmark_models.py / benchmark_charge.py / export_models.py)
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+joblib
+torch
+# To reproduce the sandbox run exactly (requires Python <= 3.11):
+#   pip install numpy==1.26.4 torch==2.2.2

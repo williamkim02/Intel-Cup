@@ -12,10 +12,11 @@ cap_ratio) score very high partly by leakage. The charge-based models are the fa
 | 1dcnn_discharge.pt    | 1D-CNN (PyTorch)     | (4,128) V/absI/T/cumQ waveform |
 | pi_1dcnn_discharge.pt | PI-1D-CNN (PyTorch)  | (4,128) waveform + physics head (Re,Rct) |
 | pinn_discharge.pt     | PINN (PyTorch)       | 4 SOC-window feats (cap_ratio, dv_norm) |
-| svm_discharge.joblib  | SVR (scikit-learn)   | hybrid scalar (Re/Rct + early V/I/T) |
-| mlp_discharge.joblib  | MLP (scikit-learn)   | hybrid scalar |
+| svm_discharge.joblib  | SVR (scikit-learn)   | discharge-curve scalar (V/I/T only, NO impedance R) |
+| mlp_discharge.joblib  | MLP (scikit-learn)   | same curve-only scalar |
 
-Each .pt stores `state_dict` + normalization stats (`chan_mu/chan_sd` or `feat_mu/feat_sd`).
+Each .pt stores `state_dict` + norm stats (CNNs: `chan_mu/chan_sd`; PINN: `scaler_min/scaler_range`).
+PINN uses Donghyun's recipe (MinMaxScaler, L = MSE + 0.5*L_mono + 0.1*L_bound, x30 noise, 3000 ep).
 Rebuild the class from `train_discharge.py`, load_state_dict, normalize inputs, then infer.
 
 ## data/

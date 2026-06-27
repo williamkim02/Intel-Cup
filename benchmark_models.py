@@ -44,7 +44,9 @@ ALL_CELLS   = TRAIN_CELLS + [TEST_CELL]
 N_TS = 128
 RATED = 2.0
 
-HYBRID_FEATS = ["Re_ohm","Rct_ohm","V_start","V_10s","V_30s","V_60s",
+# Discharge-CURVE features only (NO impedance Re/Rct) — agreed: compare on the
+# discharge curve, not on separately-measured resistance.
+CURVE_FEATS = ["V_start","V_10s","V_30s","V_60s",
                 "V_drop_10s","V_drop_30s","V_drop_60s","dV_dt_avg","I_abs_avg",
                 "T_start","T_60s","T_rise_60s"]
 
@@ -117,11 +119,11 @@ def build_discharge_table():
             if rec["pinn"] is None: continue
             r = sub.loc[dno]
             if isinstance(r, pd.DataFrame): r = r.iloc[0]
-            if r[HYBRID_FEATS].isna().any(): continue
+            if r[CURVE_FEATS].isna().any(): continue
             rows.append(dict(cell=cell, dno=int(dno),
                              soh=float(r["soh_pct"]),
                              Re=float(r["Re_ohm"])*1000.0, Rct=float(r["Rct_ohm"])*1000.0,
-                             scal=r[HYBRID_FEATS].values.astype(np.float32),
+                             scal=r[CURVE_FEATS].values.astype(np.float32),
                              pinn=rec["pinn"], wav=rec["wav"]))
     df = pd.DataFrame(rows)
     print(f"[discharge] common cycles: total={len(df)}  "
@@ -154,35 +156,46 @@ def run_torch_models(tr, te, results, preds):
         return
     torch.manual_seed(42)
 
-    # ---- PINN (Donghyun): 4 feats + physics (monotonic + boundary) ----
-    class PINN(nn.Module):
-        def __init__(s, nf=4, h=32):
+    # ---- PINN (Donghyun): FAITHFUL recipe from train_soh_universal.py ----
+    #   MinMaxScaler | L = MSE + 0.5*L_mono + 0.1*L_bound | x30 noise | 3000 epochs
+    #   L_mono = relu(-dSOH/dx)^2 (autograd monotonicity)  ;  L_bound = relu(0.6-SOH)^2
+    from sklearn.preprocessing import MinMaxScaler
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    import copy
+    class SOHCurvePINN(nn.Module):
+        def __init__(s, nf=4, h=32, L=3):
             super().__init__()
-            s.net = nn.Sequential(nn.Linear(nf,h),nn.Tanh(),nn.Linear(h,h),nn.Tanh(),
-                                  nn.Linear(h,h),nn.Tanh(),nn.Linear(h,1))
+            layers=[nn.Linear(nf,h),nn.Tanh()]
+            for _ in range(L-1): layers += [nn.Linear(h,h),nn.Tanh()]
+            layers.append(nn.Linear(h,1)); s.net=nn.Sequential(*layers)
         def forward(s,x): return torch.sigmoid(s.net(x))
-
-    Xtr = torch.tensor(np.vstack(tr.pinn.values)); ytr = torch.tensor((tr.soh.values/100.).astype(np.float32)).view(-1,1)
-    Xte = torch.tensor(np.vstack(te.pinn.values))
-    mu, sd = Xtr.mean(0), Xtr.std(0)+1e-6
-    Xtr_n, Xte_n = (Xtr-mu)/sd, (Xte-mu)/sd
-    # noise augmentation
-    aug_X = [Xtr_n]; aug_y=[ytr]
-    g = torch.Generator().manual_seed(0)
-    for _ in range(20):
-        aug_X.append(Xtr_n + 0.02*torch.randn(Xtr_n.shape, generator=g)); aug_y.append(ytr)
-    AX, AY = torch.cat(aug_X), torch.cat(aug_y)
-    pinn = PINN(); opt = torch.optim.Adam(pinn.parameters(), lr=1e-3)
-    for ep in range(1500):
-        opt.zero_grad()
-        out = pinn(AX); loss = ((out-AY)**2).mean()
-        # boundary penalty (keep in [0,1] — sigmoid already, light reg)
-        loss = loss + 0.1*((out.clamp(max=0)**2).mean() + ((out-1).clamp(min=0)**2).mean())
-        loss.backward(); opt.step()
-    pinn.eval()
+    def pinn_loss(model, x, y, lm=0.5, lb=0.1):
+        pred=model(x); l_data=((pred-y)**2).mean()
+        xp=x.detach().clone().requires_grad_(True)
+        grads=torch.autograd.grad(model(xp).sum(), xp, create_graph=True)[0]
+        l_mono=torch.relu(-grads).pow(2).mean()
+        l_bound=torch.relu(0.6-pred).pow(2).mean()
+        return l_data + lm*l_mono + lb*l_bound
+    Xraw=np.vstack(tr.pinn.values).astype(np.float32); yraw=(tr.soh.values/100.).astype(np.float32)
+    nstd=np.array([0.0005,0.020,0.0005,0.020],np.float32)        # cap_ratio / dv_norm noise std
+    rng=np.random.default_rng(42); Xa=[Xraw]; Ya=[yraw]
+    for _ in range(30):
+        Xa.append(Xraw+rng.normal(0,1,Xraw.shape).astype(np.float32)*nstd); Ya.append(yraw)
+    Xaug=np.vstack(Xa); yaug=np.concatenate(Ya)
+    sc=MinMaxScaler().fit(Xaug)
+    Xtr_n=torch.tensor(sc.transform(Xaug).astype(np.float32)); ytr_n=torch.tensor(yaug).view(-1,1)
+    Xtr_eval=torch.tensor(sc.transform(Xraw).astype(np.float32))
+    Xte_n=torch.tensor(sc.transform(np.vstack(te.pinn.values)).astype(np.float32))
+    torch.manual_seed(42); pinn=SOHCurvePINN(4)
+    opt=torch.optim.Adam(pinn.parameters(),lr=1e-3); sched=ReduceLROnPlateau(opt,patience=200,factor=0.5,min_lr=1e-5)
+    best=1e9; best_state=None
+    for ep in range(int(os.environ.get("PINN_EPOCHS","3000"))):
+        pinn.train(); opt.zero_grad(); loss=pinn_loss(pinn,Xtr_n,ytr_n)
+        loss.backward(); opt.step(); sched.step(loss.detach())
+        if loss.item()<best: best=loss.item(); best_state=copy.deepcopy(pinn.state_dict())
+    pinn.load_state_dict(best_state); pinn.eval()
     with torch.no_grad():
-        yp = pinn(Xte_n).numpy().ravel()*100
-        yp_tr = pinn(Xtr_n).numpy().ravel()*100
+        yp=pinn(Xte_n).numpy().ravel()*100; yp_tr=pinn(Xtr_eval).numpy().ravel()*100
     results["PINN (Donghyun)"]={"train":metrics(tr.soh.values,yp_tr),"test":metrics(te.soh.values,yp)}; preds["PINN (Donghyun)"]=yp
 
     # ---- CNN backbone ----

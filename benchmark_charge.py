@@ -112,20 +112,29 @@ def main():
     a,b=train_cnn(False); results["1D-CNN (Evan)"]={"train":metrics(ytr_np,a),"test":metrics(yt,b)}; preds["1D-CNN (Evan)"]=b
     a,b=train_cnn(True);  results["PI-1D-CNN (Evan)"]={"train":metrics(ytr_np,a),"test":metrics(yt,b)}; preds["PI-1D-CNN (Evan)"]=b
 
-    # ----- PINN -----
-    Xtr=torch.tensor(np.vstack(tr.pinn.values)); Xte=torch.tensor(np.vstack(te.pinn.values))
-    mu,sd=Xtr.mean(0),Xtr.std(0)+1e-6; Xtr_n,Xte_n=(Xtr-mu)/sd,(Xte-mu)/sd
-    ytrp=torch.tensor((tr.soh.values/100.).astype(np.float32)).view(-1,1)
-    g=torch.Generator().manual_seed(0); aX=[Xtr_n]; aY=[ytrp]
-    for _ in range(20): aX.append(Xtr_n+0.02*torch.randn(Xtr_n.shape,generator=g)); aY.append(ytrp)
-    AX,AY=torch.cat(aX),torch.cat(aY); pinn=PINN(); opt=torch.optim.Adam(pinn.parameters(),lr=1e-3)
-    for ep in range(1500):
-        opt.zero_grad(); out=pinn(AX)
-        loss=((out-AY)**2).mean()+0.1*((out.clamp(max=0)**2).mean()+((out-1).clamp(min=0)**2).mean())
-        loss.backward(); opt.step()
-    pinn.eval()
+    # ----- PINN (Donghyun FAITHFUL recipe: MinMaxScaler, L_mono+L_bound, x30, 3000 ep) -----
+    from sklearn.preprocessing import MinMaxScaler
+    from torch.optim.lr_scheduler import ReduceLROnPlateau
+    import copy
+    def pinn_loss(model,x,y,lm=0.5,lb=0.1):
+        p=model(x); xp=x.detach().clone().requires_grad_(True)
+        g=torch.autograd.grad(model(xp).sum(),xp,create_graph=True)[0]
+        return ((p-y)**2).mean()+lm*torch.relu(-g).pow(2).mean()+lb*torch.relu(0.6-p).pow(2).mean()
+    Xraw=np.vstack(tr.pinn.values).astype(np.float32); yraw=(tr.soh.values/100.).astype(np.float32)
+    nstd=np.array([0.0005,0.020,0.0005,0.020],np.float32); rng=np.random.default_rng(42)
+    Xa=[Xraw];Ya=[yraw]
+    for _ in range(30): Xa.append(Xraw+rng.normal(0,1,Xraw.shape).astype(np.float32)*nstd);Ya.append(yraw)
+    sc=MinMaxScaler().fit(np.vstack(Xa))
+    Xtr_n=torch.tensor(sc.transform(np.vstack(Xa)).astype(np.float32)); ytr_n=torch.tensor(np.concatenate(Ya)).view(-1,1)
+    Xev=torch.tensor(sc.transform(Xraw).astype(np.float32)); Xte_n=torch.tensor(sc.transform(np.vstack(te.pinn.values)).astype(np.float32))
+    torch.manual_seed(42); pinn=PINN(); opt=torch.optim.Adam(pinn.parameters(),lr=1e-3); sch=ReduceLROnPlateau(opt,patience=200,factor=0.5,min_lr=1e-5)
+    best=1e9;bs=None
+    for ep in range(int(os.environ.get("PINN_EPOCHS","3000"))):
+        pinn.train();opt.zero_grad();loss=pinn_loss(pinn,Xtr_n,ytr_n);loss.backward();opt.step();sch.step(loss.detach())
+        if loss.item()<best:best=loss.item();bs=copy.deepcopy(pinn.state_dict())
+    pinn.load_state_dict(bs);pinn.eval()
     with torch.no_grad():
-        yp=pinn(Xte_n).numpy().ravel()*100; yp_tr=pinn(Xtr_n).numpy().ravel()*100
+        yp=pinn(Xte_n).numpy().ravel()*100; yp_tr=pinn(Xev).numpy().ravel()*100
     results["PINN (Donghyun)"]={"train":metrics(ytr_np,yp_tr),"test":metrics(yt,yp)}; preds["PINN (Donghyun)"]=yp
 
     order=sorted(results,key=lambda k:results[k]["test"]["R2"],reverse=True)
