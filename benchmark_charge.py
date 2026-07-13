@@ -18,7 +18,7 @@ import torch, torch.nn as nn
 
 warnings.filterwarnings("ignore"); np.random.seed(42); torch.manual_seed(42)
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SVMDIR = os.path.join(ROOT, "Intel-Cup", "models", "SVM")
+SVMDIR = os.path.join(ROOT, "Charge-based models", "data")
 TRAIN_CELLS=["B0005","B0006","B0007"]; TEST_CELL="B0018"; N_TS=128; RATED=2.0
 
 def cls3(y): y=np.asarray(y,float); return np.where(y>80,0,np.where(y>=70,1,2))

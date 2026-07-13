@@ -34,11 +34,11 @@ from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.dirname(__file__))
-from train_soh_curves import SOHCurvePINN
+from pinn_model import SOHCurvePINN
 
 # ── 설정 ──────────────────────────────────────────────────────────────────────
-MAT_DIR    = os.path.join(os.path.dirname(__file__), "../5.+Battery+Data+Set")
-CSV_DIR    = os.path.join(os.path.dirname(__file__), "../NASA")
+MAT_DIR    = os.path.join(os.path.dirname(__file__), "data", "NASA_raw")
+CSV_DIR    = os.path.join(os.path.dirname(__file__), "data", "NASA_raw")
 
 TRAIN_CELLS = ["B0005", "B0006", "B0007"]
 TEST_CELL   = "B0018"

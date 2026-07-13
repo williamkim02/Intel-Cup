@@ -37,7 +37,8 @@ warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SVMDIR = os.path.join(ROOT, "Intel-Cup", "models", "SVM")
+MATDIR = os.path.join(ROOT, "data", "NASA_raw")
+SVMDIR = os.path.join(ROOT, "Discharge-based models", "data")
 TRAIN_CELLS = ["B0005", "B0006", "B0007"]
 TEST_CELL   = "B0018"
 ALL_CELLS   = TRAIN_CELLS + [TEST_CELL]
@@ -69,7 +70,7 @@ def resamp(x, n=N_TS):
 # ----------------------------------------------------------------------------
 def load_discharge_mat(cell):
     """Per discharge cycle: waveform (V,|I|,T), pinn feats, cap_total. Keyed by dno."""
-    m = scipy.io.loadmat(os.path.join(ROOT, f"{cell}.mat"))[cell][0,0]
+    m = scipy.io.loadmat(os.path.join(MATDIR, f"{cell}.mat"))[cell][0,0]
     cyc = m["cycle"][0]; out = {}; dno = 0
     for i in range(cyc.shape[0]):
         c = cyc[i]

@@ -39,7 +39,7 @@ warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 ROOT    = os.path.dirname(os.path.abspath(__file__))
-MATDIR  = os.path.join(ROOT, "..", "5.+Battery+Data+Set")
+MATDIR  = os.path.join(ROOT, "..", "data", "NASA_raw")
 SVMDIR  = os.path.join(ROOT, "data")
 TRAIN_CELLS = ["B0005", "B0006", "B0007"]
 TEST_CELL   = "B0018"

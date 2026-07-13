@@ -53,8 +53,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
 
 import joblib
 import numpy as np
@@ -490,11 +497,23 @@ def print_model_result(metrics: Dict) -> None:
 # Main
 # =============================================================================
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--discharge-csv", default="data/nasa_all_cells_discharge_features.csv")
-    parser.add_argument("--charge-csv", default="data/nasa_all_cells_charge_features.csv")
-    parser.add_argument("--charge-waveform-csv", default="data/nasa_all_cells_charge_waveform_101.csv")
+    parser.add_argument(
+        "--discharge-csv",
+        default=str(_REPO_ROOT / "Discharge-based models" / "data" / "nasa_all_cells_discharge_features.csv"),
+    )
+    parser.add_argument(
+        "--charge-csv",
+        default=str(_REPO_ROOT / "Charge-based models" / "data" / "nasa_all_cells_charge_features.csv"),
+    )
+    parser.add_argument(
+        "--charge-waveform-csv",
+        default=str(_REPO_ROOT / "Charge-based models" / "data" / "nasa_all_cells_charge_waveform_101.csv"),
+    )
     parser.add_argument("--out-dir", default="outputs/svr_training_by_input_results")
     parser.add_argument("--epsilon", type=float, default=0.5)
     parser.add_argument("--waveform-C", type=float, default=100.0)

@@ -20,8 +20,17 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import copy
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SVMDIR = os.path.join(ROOT, "Intel-Cup", "models", "SVM")
+DISC_SVMDIR = os.path.join(ROOT, "Discharge-based models", "data")
+CHRG_SVMDIR = os.path.join(ROOT, "Charge-based models", "data")
 np.random.seed(42); torch.manual_seed(42)
+
+def copy_if_new(src, dst_dir):
+    """Copy src into dst_dir, skipping if it would copy a file onto itself
+    (the export target and the canonical data source can be the same folder)."""
+    dst = os.path.join(dst_dir, os.path.basename(src))
+    if os.path.exists(dst) and os.path.samefile(src, dst):
+        return
+    shutil.copy(src, dst)
 
 # ---- model defs (identical to the benchmark scripts) ----
 class CNN(nn.Module):
@@ -126,7 +135,7 @@ def export_discharge():
         wav=np.stack(df.wav.values), scal=np.vstack(df.scal.values), pinn=np.vstack(df.pinn.values),
         soh=df.soh.values, cell=df.cell.values, is_test=(df.cell=="B0018").values,
         Re_mOhm=df.Re.values, Rct_mOhm=df.Rct.values, scal_features=np.array(CURVE_FEATS))
-    shutil.copy(os.path.join(SVMDIR,"nasa_all_cells_discharge_features.csv"), DD)
+    copy_if_new(os.path.join(DISC_SVMDIR,"nasa_all_cells_discharge_features.csv"), DD)
     shutil.copy(os.path.join(ROOT,"benchmark_models.py"), os.path.join(base,"train_discharge.py"))
     for f,dst in [("benchmark_discharge_metrics.csv","metrics_discharge.csv"),
                   ("benchmark_discharge_parity.png","parity_discharge.png")]:
@@ -165,7 +174,7 @@ def export_charge():
         wav=np.stack(df.wav.values), pinn=np.vstack(df.pinn.values), soh=df.soh.values,
         cell=df.cell.values, is_test=(df.cell=="B0018").values, Re_mOhm=df.Re.values, Rct_mOhm=df.Rct.values)
     for f in ["nasa_all_cells_charge_waveform_101.csv","nasa_all_cells_charge_features.csv"]:
-        shutil.copy(os.path.join(SVMDIR,f), DD)
+        copy_if_new(os.path.join(CHRG_SVMDIR,f), DD)
     shutil.copy(os.path.join(ROOT,"benchmark_charge.py"), os.path.join(base,"train_charge.py"))
     for f,dst in [("benchmark_charge_metrics.csv","metrics_charge.csv"),
                   ("benchmark_charge_parity.png","parity_charge.png")]:

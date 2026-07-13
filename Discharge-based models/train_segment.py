@@ -189,8 +189,8 @@ def main():
     wavs     = npz['wav']       # (636, 3, 128)
     sohs     = npz['soh']
     cells    = npz['cell']
-    res      = npz['re']        # mΩ
-    rcts     = npz['rct']       # mΩ
+    res      = npz['Re_mOhm']   # mΩ
+    rcts     = npz['Rct_mOhm']  # mΩ
     is_tests = npz['is_test']
 
     # Extract all segments
