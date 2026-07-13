@@ -11,13 +11,15 @@ FAIRNESS PROTOCOL (identical for every model):
                   scored on identical points.
   - Metrics     : RMSE(%), MAE(%), R2, 3-class accuracy
                   (Good > 80, Marginal 70-80, Replace < 70)
-  - Leakage ctrl: discharge waveform uses V, |I|, T only (NO cumulative-charge
-                  channel), so the CNNs cannot read capacity off the input.
+  - Leakage ctrl:
+      * Discharge waveform uses V, |I|, T only (3 channels, NO cumulative-charge).
+      * PINN uses time-fixed voltage features (V_10s, V_30s, V_60s, V_120s)
+        instead of SOC-window capacity ratios, which directly encode SOH.
 
 Models:
   SVM (Semin)        : SVR(rbf) on hybrid discharge scalar features
   MLP (Evan)         : MLPRegressor on the SAME scalar features (fair vs SVM)
-  PINN (Donghyun)    : SOHCurvePINN (4 normalized SOC-interval feats) + physics loss
+  PINN (Donghyun)    : SOHCurvePINN (4 time-fixed voltage feats) + physics loss
   1D-CNN (Evan)      : Conv1d backbone on (3,128) V/I/T waveform
   PI-1D-CNN (Evan)   : same backbone + physics head (Re/Rct from NASA impedance)
 """
@@ -36,8 +38,9 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-SVMDIR = os.path.join(ROOT, "Intel-Cup", "models", "SVM")
+ROOT    = os.path.dirname(os.path.abspath(__file__))
+MATDIR  = os.path.join(ROOT, "..", "5.+Battery+Data+Set")
+SVMDIR  = os.path.join(ROOT, "data")
 TRAIN_CELLS = ["B0005", "B0006", "B0007"]
 TEST_CELL   = "B0018"
 ALL_CELLS   = TRAIN_CELLS + [TEST_CELL]
@@ -49,6 +52,12 @@ RATED = 2.0
 CURVE_FEATS = ["V_start","V_10s","V_30s","V_60s",
                 "V_drop_10s","V_drop_30s","V_drop_60s","dV_dt_avg","I_abs_avg",
                 "T_start","T_60s","T_rise_60s"]
+
+# PINN features: time-fixed voltage points (leakage-free).
+# V at t=10/30/60/120s does NOT encode total capacity — it reflects IR drop and
+# polarisation kinetics at a fixed elapsed time. All features increase monotonically
+# with SOH, so the monotonicity physics loss is correctly oriented.
+PINN_FEATS = ["V_10s", "V_30s", "V_60s", "V_120s"]
 
 # ----------------------------------------------------------------------------
 def cls3(y):
@@ -69,7 +78,7 @@ def resamp(x, n=N_TS):
 # ----------------------------------------------------------------------------
 def load_discharge_mat(cell):
     """Per discharge cycle: waveform (V,|I|,T), pinn feats, cap_total. Keyed by dno."""
-    m = scipy.io.loadmat(os.path.join(ROOT, f"{cell}.mat"))[cell][0,0]
+    m = scipy.io.loadmat(os.path.join(MATDIR, f"{cell}.mat"))[cell][0,0]
     cyc = m["cycle"][0]; out = {}; dno = 0
     for i in range(cyc.shape[0]):
         c = cyc[i]
@@ -84,28 +93,9 @@ def load_discharge_mat(cell):
         cap = float(d["Capacity"].flatten()[0])
         if len(V) < 10 or not (np.isfinite(V).all() and np.isfinite(I).all()):
             continue
-        dt = np.diff(tm, prepend=tm[0])
-        cumAh = np.cumsum(np.abs(I)*dt)/3600.0          # cumulative discharged charge
-        wav = np.stack([resamp(V), resamp(np.abs(I)), resamp(T), resamp(cumAh)])  # (4,128)
-        pf = pinn_feats(V,I,T,tm,cap)
-        out[dno] = dict(wav=wav.astype(np.float32), pinn=pf, cap=cap)
+        wav = np.stack([resamp(V), resamp(np.abs(I)), resamp(T)])  # (3,128) NO cumAh
+        out[dno] = dict(wav=wav.astype(np.float32), cap=cap)
     return out
-
-def pinn_feats(V,I,T,tm,cap):
-    """Donghyun's 4 normalized SOC-interval feats: cap_ratio & dv_norm on 100-80 / 80-60."""
-    dt = np.diff(tm, prepend=tm[0])
-    cumAh = np.cumsum(np.abs(I)*dt)/3600.0
-    soc = np.clip(1 - cumAh/max(cap,1e-6), 0, 1)
-    feats = []
-    for hi, lo in [(1.0,0.8),(0.8,0.6)]:
-        mask = (soc <= hi+0.02) & (soc >= lo-0.02)
-        if mask.sum() < 5: return None
-        segAh, segV = cumAh[mask], V[mask]
-        cap_ah = segAh[-1]-segAh[0]
-        if cap_ah <= 1e-6: return None
-        dv = (segV[-1]-segV[0])/cap_ah
-        feats += [cap_ah/RATED, dv*RATED]
-    return np.array(feats, np.float32)   # [cr_100_80, dv_100_80, cr_80_60, dv_80_60]
 
 # ----------------------------------------------------------------------------
 def build_discharge_table():
@@ -116,15 +106,16 @@ def build_discharge_table():
         sub = disc_csv[disc_csv.cell_id == cell].set_index("discharge_cycle")
         for dno, rec in mat.items():
             if dno not in sub.index: continue
-            if rec["pinn"] is None: continue
             r = sub.loc[dno]
             if isinstance(r, pd.DataFrame): r = r.iloc[0]
             if r[CURVE_FEATS].isna().any(): continue
+            if r[PINN_FEATS].isna().any(): continue
             rows.append(dict(cell=cell, dno=int(dno),
                              soh=float(r["soh_pct"]),
                              Re=float(r["Re_ohm"])*1000.0, Rct=float(r["Rct_ohm"])*1000.0,
                              scal=r[CURVE_FEATS].values.astype(np.float32),
-                             pinn=rec["pinn"], wav=rec["wav"]))
+                             pinn=r[PINN_FEATS].values.astype(np.float32),
+                             wav=rec["wav"]))
     df = pd.DataFrame(rows)
     print(f"[discharge] common cycles: total={len(df)}  "
           f"train={ (df.cell!=TEST_CELL).sum() }  test(B0018)={ (df.cell==TEST_CELL).sum() }")
@@ -133,18 +124,28 @@ def build_discharge_table():
 # ----------------------------------------------------------------------------
 # sklearn models
 def run_svm(tr, te, feat="scal"):
+    import joblib
     Xtr = np.vstack(tr[feat].values); Xte = np.vstack(te[feat].values)
-    m = Pipeline([("sc",StandardScaler()), ("svr",SVR(kernel="rbf",C=100,epsilon=0.1))])
+    # C=400, eps=0.05: selected by LOCO-CV on B0005/B0006/B0007 (CV_R²=0.482)
+    m = Pipeline([("sc",StandardScaler()), ("svr",SVR(kernel="rbf",C=400,epsilon=0.05))])
     m.fit(Xtr, tr.soh.values)
+    os.makedirs(os.path.join(ROOT, "models"), exist_ok=True)
+    joblib.dump({"model": m, "features": CURVE_FEATS},
+                os.path.join(ROOT, "models/svm_discharge.joblib"))
     return m.predict(Xtr), m.predict(Xte)
 
 def run_mlp(tr, te, feat="scal"):
     Xtr = np.vstack(tr[feat].values); Xte = np.vstack(te[feat].values)
-    sc = StandardScaler().fit(Xtr)
-    m = MLPRegressor(hidden_layer_sizes=(64,64,64), activation="tanh",
-                     max_iter=4000, random_state=42, early_stopping=False, alpha=1e-3)
-    m.fit(sc.transform(Xtr), tr.soh.values)
-    return m.predict(sc.transform(Xtr)), m.predict(sc.transform(Xte))
+    import joblib
+    # (128,64), alpha=5e-3: selected by LOCO-CV on B0005/B0006/B0007 (CV_R²=0.438)
+    pipe = Pipeline([("sc", StandardScaler()),
+                     ("mlp", MLPRegressor(hidden_layer_sizes=(128,64), activation="relu",
+                                          solver="lbfgs", max_iter=3000, random_state=42, alpha=5e-3))])
+    pipe.fit(Xtr, tr.soh.values)
+    os.makedirs(os.path.join(ROOT, "models"), exist_ok=True)
+    joblib.dump({"model": pipe, "features": CURVE_FEATS},
+                os.path.join(ROOT, "models/mlp_discharge.joblib"))
+    return pipe.predict(Xtr), pipe.predict(Xte)
 
 # ----------------------------------------------------------------------------
 # torch models (PINN, 1D-CNN, PI-1D-CNN)
@@ -157,13 +158,13 @@ def run_torch_models(tr, te, results, preds):
     torch.manual_seed(42)
 
     # ---- PINN (Donghyun): FAITHFUL recipe from train_soh_universal.py ----
-    #   MinMaxScaler | L = MSE + 0.5*L_mono + 0.1*L_bound | x30 noise | 3000 epochs
-    #   L_mono = relu(-dSOH/dx)^2 (autograd monotonicity)  ;  L_bound = relu(0.6-SOH)^2
+    #   MinMaxScaler | L = MSE + 0.1*L_mono + 0.1*L_bound | x30 noise | 3000 epochs
+    #   h=128, L=3: selected by LOCO-CV (CV_R²=0.652). lm=0.1 beats lm=0.5 in LOCO-CV.
     from sklearn.preprocessing import MinMaxScaler
     from torch.optim.lr_scheduler import ReduceLROnPlateau
     import copy
     class SOHCurvePINN(nn.Module):
-        def __init__(s, nf=4, h=32, L=3):
+        def __init__(s, nf=4, h=128, L=3):
             super().__init__()
             layers=[nn.Linear(nf,h),nn.Tanh()]
             for _ in range(L-1): layers += [nn.Linear(h,h),nn.Tanh()]
@@ -176,8 +177,9 @@ def run_torch_models(tr, te, results, preds):
         l_mono=torch.relu(-grads).pow(2).mean()
         l_bound=torch.relu(0.6-pred).pow(2).mean()
         return l_data + lm*l_mono + lb*l_bound
+    # PINN features: V_10s, V_30s, V_60s, V_120s (leakage-free, all monotone with SOH)
     Xraw=np.vstack(tr.pinn.values).astype(np.float32); yraw=(tr.soh.values/100.).astype(np.float32)
-    nstd=np.array([0.0005,0.020,0.0005,0.020],np.float32)        # cap_ratio / dv_norm noise std
+    nstd=np.array([0.002,0.002,0.002,0.002],np.float32)           # ~2mV voltage noise
     rng=np.random.default_rng(42); Xa=[Xraw]; Ya=[yraw]
     for _ in range(30):
         Xa.append(Xraw+rng.normal(0,1,Xraw.shape).astype(np.float32)*nstd); Ya.append(yraw)
@@ -190,24 +192,35 @@ def run_torch_models(tr, te, results, preds):
     opt=torch.optim.Adam(pinn.parameters(),lr=1e-3); sched=ReduceLROnPlateau(opt,patience=200,factor=0.5,min_lr=1e-5)
     best=1e9; best_state=None
     for ep in range(int(os.environ.get("PINN_EPOCHS","3000"))):
-        pinn.train(); opt.zero_grad(); loss=pinn_loss(pinn,Xtr_n,ytr_n)
+        pinn.train(); opt.zero_grad(); loss=pinn_loss(pinn,Xtr_n,ytr_n,lm=0.1,lb=0.1)
         loss.backward(); opt.step(); sched.step(loss.detach())
         if loss.item()<best: best=loss.item(); best_state=copy.deepcopy(pinn.state_dict())
     pinn.load_state_dict(best_state); pinn.eval()
     with torch.no_grad():
         yp=pinn(Xte_n).numpy().ravel()*100; yp_tr=pinn(Xtr_eval).numpy().ravel()*100
     results["PINN (Donghyun)"]={"train":metrics(tr.soh.values,yp_tr),"test":metrics(te.soh.values,yp)}; preds["PINN (Donghyun)"]=yp
+    # Save PINN model
+    os.makedirs(os.path.join(ROOT,"models"), exist_ok=True)
+    torch.save({"state_dict": best_state,
+                "scaler_min": sc.data_min_.astype(np.float32),
+                "scaler_range": sc.data_range_.astype(np.float32),
+                "pinn_feats": PINN_FEATS},
+               os.path.join(ROOT,"models/pinn_discharge.pt"))
 
     # ---- CNN backbone ----
     class CNN(nn.Module):
-        def __init__(s, nc=4, physics=False):
+        def __init__(s, nc=3, physics=False):
             super().__init__()
+            # Non-physics: drop=0.3/fc=0.6 by LOCO-CV (CV_R²=0.755).
+            # Physics CNN: drop=0.0, Re/Rct auxiliary loss provides regularisation.
+            drop = 0.0 if physics else 0.3
             s.feat = nn.Sequential(
-                nn.Conv1d(nc,16,7,padding=3), nn.BatchNorm1d(16), nn.ReLU(),
-                nn.Conv1d(16,32,5,padding=2), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.Conv1d(nc,16,7,padding=3), nn.BatchNorm1d(16), nn.ReLU(), nn.Dropout(drop),
+                nn.Conv1d(16,32,5,padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.Dropout(drop),
                 nn.Conv1d(32,64,3,padding=1), nn.BatchNorm1d(64), nn.ReLU(),
                 nn.AdaptiveAvgPool1d(1))
-            s.reg = nn.Sequential(nn.Linear(64,32),nn.ReLU(),nn.Linear(32,1))
+            fc_drop = 0.0 if physics else 0.6
+            s.reg = nn.Sequential(nn.Linear(64,32), nn.ReLU(), nn.Dropout(fc_drop), nn.Linear(32,1))
             s.physics = physics
             if physics: s.phy = nn.Sequential(nn.Linear(64,32),nn.ReLU(),nn.Linear(32,2))
         def forward(s,x):
@@ -224,9 +237,14 @@ def run_torch_models(tr, te, results, preds):
 
     def train_cnn(physics):
         torch.manual_seed(42)
-        net = CNN(4, physics); opt = torch.optim.Adam(net.parameters(), lr=2e-3, weight_decay=1e-4)
+        # lr/wd/ep by LOCO-CV: physics lr=3e-3,wd=1e-4,ep=120 (CV_R²=0.750)
+        #                      non-physics lr=1e-3,wd=1e-3,ep=200 (CV_R²=0.755)
+        wd = 1e-4 if physics else 1e-3
+        ep_max = 120 if physics else 200
+        lr = 3e-3 if physics else 1e-3
+        net = CNN(3, physics); opt = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=wd)
         n = Wtr_n.shape[0]; idx = np.arange(n)
-        for ep in range(120):
+        for ep in range(ep_max):
             net.train(); np.random.seed(ep); np.random.shuffle(idx)
             for b in range(0, n, 32):
                 bi = idx[b:b+32]
@@ -240,6 +258,12 @@ def run_torch_models(tr, te, results, preds):
         with torch.no_grad():
             yp = net(Wte_n)[0].numpy().ravel()*100
             yp_tr = net(Wtr_n)[0].numpy().ravel()*100
+        # Save model
+        fname = "pi_1dcnn_discharge.pt" if physics else "1dcnn_discharge.pt"
+        torch.save({"state_dict": net.state_dict(),
+                    "chan_mu": cmu.squeeze().numpy(),
+                    "chan_sd": csd.squeeze().numpy()},
+                   os.path.join(ROOT, "models", fname))
         return yp_tr, yp
 
     a,b = train_cnn(False)
@@ -250,6 +274,21 @@ def run_torch_models(tr, te, results, preds):
 # ----------------------------------------------------------------------------
 def main():
     df = build_discharge_table()
+
+    # Save updated npz so plot_all_models.py uses the new leakage-free features
+    is_test = (df.cell == TEST_CELL).values
+    os.makedirs(os.path.join(ROOT, "data"), exist_ok=True)
+    np.savez(os.path.join(ROOT, "data/discharge_dataset.npz"),
+             soh=df.soh.values,
+             wav=np.stack(df.wav.values),
+             pinn=np.stack(df.pinn.values),
+             scal=np.stack(df.scal.values),
+             re=df.Re.values.astype(np.float32),
+             rct=df.Rct.values.astype(np.float32),
+             is_test=is_test,
+             cell=np.array(df.cell.values))
+    print("Saved: data/discharge_dataset.npz")
+
     tr = df[df.cell != TEST_CELL].reset_index(drop=True)
     te = df[df.cell == TEST_CELL].reset_index(drop=True)
     yt = te.soh.values
