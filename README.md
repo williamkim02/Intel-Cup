@@ -33,8 +33,9 @@ Intel-Cup/
 ├── app.py                     # Streamlit decision-support dashboard (deployed instrument)
 ├── pinn_model.py              # PINN model definition (shared by app + training)
 ├── knee_detector.py           # knee-point / lifetime-tracking logic (dashboard aux tab)
-├── train_soh_segment.py       # trains the DEPLOYED ±10% segment PINN
 ├── train_soh_universal.py     # trains the full-discharge (universal) PINN
+│                              #   (DEPLOYED ±10% segment PINN is trained in
+│                              #    "Discharge-based models/train_segment.py")
 ├── export_models.py           # PyTorch → ONNX → OpenVINO IR (FP16) export for DK-2500
 ├── benchmark_models.py        # fair discharge benchmark (SVR/MLP/1D-CNN/PI-1D-CNN/PINN)
 ├── benchmark_charge.py        # fair charge benchmark (leakage-free)
@@ -43,14 +44,15 @@ Intel-Cup/
 ├── requirements.txt · run.bat
 │
 ├── models/                    # trained weights loaded by app.py
-│   ├── soh_segment_model.pth      # ★ deployed model (±10% segment PINN)
+│   ├── soh_segment_model.pth      # ★ deployed model (±10% segment PINN, voltage-only, leakage-free)
 │   ├── soh_universal_model.pth    # full-discharge PINN
 │   ├── rul_model.pth              # remaining-useful-life
 │   ├── parking_model.pkl          # cold-weather / parking risk
 │   └── SVR_SVM/                   # SVR/SVM baselines (resistance & curve features)
 │
-├── Discharge-based models/    # discharge + ±10% segment study (report §3.4.2 / §3.4.4)
-└── Charge-based models/       # charge-curve study, leakage-free (report §3.4.3)
+├── Discharge-based models/    # discharge + ±10% segment study + DEPLOYED segment trainer (§3.4.2 / §3.4.4)
+├── Charge-based models/       # charge-curve study, leakage-free (report §3.4.3)
+└── Real Data/                 # real DK-2500 measured discharge + post-processing + on-hardware check
 ```
 
 ### How folders map to the report
@@ -58,10 +60,11 @@ Intel-Cup/
 | Folder / file | Report section | Role |
 |---|---|---|
 | `app.py`, `knee_detector.py`, `models/` | Ch.4 (End-to-End System) | Deployed dashboard + weights |
-| `train_soh_segment.py` + `models/soh_segment_model.pth` | §3.4.4, §3.5 | **Deployed** ±10% segment PINN |
-| `train_soh_universal.py` + `models/soh_universal_model.pth` | §3.4.2 | Full-discharge PINN reference |
+| `Discharge-based models/train_segment.py` + `models/soh_segment_model.pth` | §3.4.4, §3.5 | **Deployed** ±10% segment PINN — voltage-only `[V_start, V_end, ΔV, SOC_mid]`, leakage-free |
+| `train_soh_universal.py` + `models/soh_universal_model.pth` | §3.4.2 | Full-discharge PINN reference (capacity-informed) |
 | `Discharge-based models/` | §3.4.2, §3.4.4 | Discharge & segment representations |
 | `Charge-based models/` | §3.4.3 | Charge representation (leakage-free) |
+| `Real Data/` | Ch.4 (real-hardware check) | DK-2500 measured discharge → post-processed → run through the deployed model |
 | `models/SVR_SVM/` | §3.3.1, §3.4.1 | SVR/MLP resistance & curve baselines |
 | `benchmark_*`, `MODEL_BENCHMARK_RESULTS.md` | §3.4 | Fair cross-model comparison |
 | `export_models.py` | §4.1 | OpenVINO FP16 deployment export |
@@ -83,10 +86,10 @@ Intel-Cup/
 ## Reproduce
 
 ```bash
-python benchmark_models.py      # discharge benchmark → benchmark_discharge_*.{csv,json,png}
-python benchmark_charge.py      # charge benchmark   → benchmark_charge_*.{csv,json,png}
-python train_soh_segment.py     # retrain deployed segment PINN
-python export_models.py         # export to OpenVINO IR (FP16) for the DK-2500
+python benchmark_models.py               # discharge benchmark → benchmark_discharge_*.{csv,json,png}
+python benchmark_charge.py               # charge benchmark   → benchmark_charge_*.{csv,json,png}
+python "Discharge-based models/train_segment.py"   # retrain the DEPLOYED voltage-window segment PINN
+python export_models.py                  # export to OpenVINO IR (FP16) for the DK-2500
 ```
 
 Dataset: NASA Prognostics Center of Excellence, *Li-ion Battery Aging Datasets* (18650 cells, 2.0 Ah).

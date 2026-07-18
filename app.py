@@ -39,8 +39,13 @@ def load_universal_model():
 
 @st.cache_resource
 def load_segment_model():
+    # Report-consistent deployed model: leakage-free voltage-window segment PINN
+    # features = [V_start, V_end, dV, SOC_mid]  (NO capacity)  — final report §3.4.4
     ckpt  = torch.load(MODEL_SEGMENT, weights_only=False, map_location="cpu")
-    model = SOHCurvePINN(n_features=3)
+    arch  = ckpt.get("arch", {"n_features": 4, "hidden_dim": 128, "hidden_layers": 3})
+    model = SOHCurvePINN(n_features=arch["n_features"],
+                         hidden_dim=arch["hidden_dim"],
+                         hidden_layers=arch["hidden_layers"])
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model, ckpt["scaler"]
@@ -73,17 +78,50 @@ def predict_soh_universal(cap_100_80, cap_80_60, dv_100_80, dv_80_60, rated_cap)
         return float(model(torch.tensor(x_n)).item())
 
 
-def predict_soh_segment(cap_ah, dv_dah, soc_hi, soc_lo, rated_cap):
+def predict_soh_segment(v_start, v_end, soc_mid):
+    """Report-consistent segment PINN: 4 voltage-only window features, NO capacity.
+    features = [V_start, V_end, dV, SOC_mid].  soc_mid: 1.0=start of discharge, 0.0=end."""
     model, scaler = load_segment_model()
-    soc_mid = (soc_hi + soc_lo) / 2.0
     x = np.array([[
-        cap_ah / rated_cap,
-        dv_dah * rated_cap,
+        v_start,
+        v_end,
+        v_start - v_end,   # dV
         soc_mid,
     ]], dtype=np.float32)
     x_n = scaler.transform(x).astype(np.float32)
     with torch.no_grad():
         return float(model(torch.tensor(x_n)).item())
+
+
+# ── Report-consistent segment feature extraction (voltage-window, sliding) ────
+
+N_TS_SEG   = 128    # resample discharge to 128 steps (matches training)
+WIN_SEG    = 13     # 13/128 ≈ 10% window
+STRIDE_SEG = 6      # 6/128  ≈ 5% stride
+
+
+def extract_segment_windows(df):
+    """V(t)/I(t) discharge CSV -> sliding 10% voltage windows.
+    Returns list of dicts: {soc_mid, v_start, v_end, dv}.  No capacity used."""
+    df = df.copy().sort_values("time").reset_index(drop=True)
+    V  = df["voltage"].values.astype(float)
+    if len(V) < WIN_SEG + 1:
+        return []
+    # resample voltage over the discharge span to 128 steps (time-normalised)
+    Vr = np.interp(np.linspace(0, 1, N_TS_SEG),
+                   np.linspace(0, 1, len(V)), V)
+    wins = []
+    for ws in range(0, N_TS_SEG - WIN_SEG + 1, STRIDE_SEG):
+        we      = ws + WIN_SEG
+        soc_mid = 1.0 - (ws + we) / 2.0 / N_TS_SEG   # 1.0=start, 0.0=end
+        v_s     = float(Vr[ws]); v_e = float(Vr[we - 1])
+        wins.append({
+            "soc_mid": round(soc_mid, 3),
+            "v_start": round(v_s, 4),
+            "v_end":   round(v_e, 4),
+            "dv":      round(v_s - v_e, 4),
+        })
+    return wins
 
 
 def predict_rul(soh_pct, rate, post_knee_flag):
@@ -160,10 +198,11 @@ def extract_features_from_csv(df, rated_cap):
 
 
 def soh_status(soh_pct):
-    if soh_pct >= 85:
+    # Final report three-class decision: Good > 80, Marginal 70-80, Replace < 70
+    if soh_pct > 80:
         return "Good", "#2ecc71"
-    elif soh_pct >= 75:
-        return "Warning", "#f39c12"
+    elif soh_pct >= 70:
+        return "Marginal", "#f39c12"
     else:
         return "Replace", "#e74c3c"
 
@@ -190,11 +229,11 @@ def render_soh_result(soh_pct, rated_cap, model_name=""):
         unsafe_allow_html=True,
     )
     if label == "Good":
-        st.success("Battery is in good condition (SOH >= 85%). No action needed.")
-    elif label == "Warning":
-        st.warning("Battery health is declining (75~85%). Monitor closely.")
+        st.success("Battery is in good condition (SOH > 80%). Suitable for reuse.")
+    elif label == "Marginal":
+        st.warning("Marginal health (70–80%). Additional screening recommended before second-life use.")
     else:
-        st.error("Battery should be replaced (SOH < 75%). Risk of failure.")
+        st.error("Battery should be replaced (SOH < 70%). Not suitable for reuse.")
 
 
 # ── 페이지 ────────────────────────────────────────────────────────────────────
@@ -216,7 +255,8 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ════════════════════════════════════════════════════════════
 with tab1:
     st.subheader("SOH — Full Cycle (100% → 60% SOC)")
-    st.caption("Higher accuracy | MAE 0.33% | Requires 100->60% discharge log")
+    st.caption("Full-discharge PINN (capacity-informed reference) | R²=0.944±0.005 on B0018 "
+               "| Requires 100→60% discharge log")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -275,7 +315,7 @@ with tab1:
                  disabled=not ready_f, key="btn_full"):
         try:
             soh = predict_soh_universal(cap_100_80, cap_80_60, dv_100_80, dv_80_60, rated_cap_f)
-            render_soh_result(soh * 100, rated_cap_f, "Universal PINN (MAE 0.33%)")
+            render_soh_result(soh * 100, rated_cap_f, "Full-discharge PINN (R²=0.944, capacity-informed reference)")
         except Exception as e:
             st.error(f"Error: {e}")
 
@@ -296,86 +336,94 @@ for hi, lo in [(1.0, 0.8), (0.8, 0.6)]:
 # TAB 2 : SOH — 빠른 구간 측정 (임의 10%)
 # ════════════════════════════════════════════════════════════
 with tab2:
-    st.subheader("SOH — Quick Segment (Any 10% SOC window)")
-    st.caption("Quick measurement | MAE ~1.1% | Works with ANY 10% discharge window (e.g. 85->75%)")
+    st.subheader("SOH — Quick Segment (Any 10% discharge window)")
+    st.caption("Deployed model | Leakage-free voltage-window PINN [V_start, V_end, ΔV, SOC_mid] "
+               "| per-cycle R²=0.921, per-window R²=0.895±0.013 (B0018) | NO capacity input")
 
     c1, c2 = st.columns([1, 1])
     with c1:
         rated_cap_s = st.number_input(
-            "Rated Capacity (Ah)", min_value=0.1, max_value=5000.0,
-            value=2.0, step=0.1, key="rc_seg",
+            "Rated Capacity (Ah)  —  display only, not used by the model", min_value=0.1,
+            max_value=5000.0, value=2.0, step=0.1, key="rc_seg",
         )
     with c2:
         st.info(
-            "어떤 SOC 구간이든 가능합니다.  \n"
-            "외부 모듈: 정전류 방전 5~10분 → 자동 계산  \n"
-            "OBD-II: 주행 중 10% SOC 구간 감지 시 추출"
+            "The deployed segment PINN uses **voltage-only** window features.  \n"
+            "Rated capacity is used **only** to show remaining Ah — it does **not** enter the prediction."
         )
 
     st.divider()
     mode_s = st.radio("Input method", ["Upload CSV", "Enter manually"], horizontal=True, key="mode_s")
 
-    seg_input = None  # {cap_ah, dv_dah, soc_hi, soc_lo}
+    seg_input = None   # {v_start, v_end, soc_mid}
+    seg_all   = None   # list of all windows (for per-cycle averaging)
 
     if mode_s == "Upload CSV":
-        st.markdown("필수 컬럼: `time`(s)  `voltage`(V)  `current`(A)")
+        st.markdown("Required columns: `time`(s)  `voltage`(V)  `current`(A)")
         up_s = st.file_uploader("Upload discharge log", type=["csv"], key="up_seg")
         if up_s:
             df_raw_s = pd.read_csv(up_s)
-            _, seg_feats, err = extract_features_from_csv(df_raw_s, rated_cap_s)
-            if err:
-                st.error(err)
-            elif not seg_feats:
-                st.warning("유효한 10% 구간 없음.")
+            wins = extract_segment_windows(df_raw_s)
+            if not wins:
+                st.warning("Not enough samples to form a 10% window.")
             else:
-                st.markdown("**감지된 SOC 구간 — 예측할 구간 선택:**")
-                seg_df = pd.DataFrame(seg_feats)
-                seg_df["label"] = seg_df.apply(
-                    lambda r: f"SOC {int(r.soc_hi*100)}%→{int(r.soc_lo*100)}%  "
-                              f"cap={r.cap_ah:.3f}Ah  dv={r.dv_dah:.3f}",
+                seg_all = wins
+                st.markdown("**Sliding 10% windows detected — pick one, or use the per-cycle average below:**")
+                wdf = pd.DataFrame(wins)
+                wdf["label"] = wdf.apply(
+                    lambda r: f"window @ SOC_mid {r.soc_mid:.2f}   "
+                              f"V {r.v_start:.3f}→{r.v_end:.3f} V   ΔV {r.dv:.3f}",
                     axis=1
                 )
-                chosen = st.selectbox("구간 선택", seg_df["label"].tolist())
-                row = seg_feats[seg_df["label"].tolist().index(chosen)]
-                seg_input = row
-                with st.expander("Selected segment features"):
+                chosen = st.selectbox("Window", wdf["label"].tolist())
+                seg_input = wins[wdf["label"].tolist().index(chosen)]
+                with st.expander("Selected window features (model input)"):
                     st.code(
-                        f"SOC {int(row['soc_hi']*100)}%->{ int(row['soc_lo']*100)}%\n"
-                        f"  cap_ah = {row['cap_ah']:.4f} Ah\n"
-                        f"  dv_dah = {row['dv_dah']:.4f} V/Ah\n"
-                        f"  soc_mid = {row['soc_mid']:.2f}"
+                        f"V_start = {seg_input['v_start']:.4f} V\n"
+                        f"V_end   = {seg_input['v_end']:.4f} V\n"
+                        f"dV      = {seg_input['dv']:.4f} V\n"
+                        f"SOC_mid = {seg_input['soc_mid']:.3f}   (1.0=start of discharge, 0.0=end)"
                     )
     else:
-        st.markdown("측정한 SOC 구간과 값을 입력하세요.")
+        st.markdown("Enter one 10% discharge window (voltage-only).")
         sc1, sc2 = st.columns(2)
         with sc1:
-            soc_hi_in = st.slider("Segment start SOC (%)", 20, 100, 85, step=5) / 100
-            soc_lo_in = st.slider("Segment end SOC (%)",   10,  95, 75, step=5) / 100
+            v_start_in = st.number_input("V_start (V)", key="vs_in", min_value=0.0, max_value=5.0,
+                                          value=3.90, step=0.01, format="%.3f")
+            v_end_in   = st.number_input("V_end (V)",   key="ve_in", min_value=0.0, max_value=5.0,
+                                          value=3.80, step=0.01, format="%.3f")
         with sc2:
-            cap_s  = st.number_input("Discharged cap_ah (Ah)", key="cs",
-                                      min_value=0.001, value=round(rated_cap_s*0.10, 3),
-                                      step=0.001, format="%.3f")
-            dv_s   = st.number_input("dV/dAh (V/Ah)", key="ds",
-                                      max_value=0.0, value=-0.45, step=0.01, format="%.3f")
-
-        if soc_hi_in <= soc_lo_in:
-            st.error("Start SOC must be higher than End SOC.")
+            soc_mid_in = st.slider("Window position SOC_mid (1.0=start → 0.0=end)",
+                                    0.0, 1.0, 0.5, step=0.05, key="socmid_in")
+        if v_end_in > v_start_in:
+            st.error("V_end should be ≤ V_start on a discharge window.")
         else:
-            seg_input = {"cap_ah": cap_s, "dv_dah": dv_s,
-                         "soc_hi": soc_hi_in, "soc_lo": soc_lo_in}
-            st.caption(f"Segment: {int(soc_hi_in*100)}%→{int(soc_lo_in*100)}%  "
-                       f"soc_mid={((soc_hi_in+soc_lo_in)/2*100):.0f}%")
+            seg_input = {"v_start": v_start_in, "v_end": v_end_in,
+                         "dv": v_start_in - v_end_in, "soc_mid": soc_mid_in}
+            st.caption(f"ΔV = {v_start_in - v_end_in:.3f} V   SOC_mid = {soc_mid_in:.2f}")
 
     st.divider()
-    if st.button("Predict SOH", type="primary", use_container_width=True,
+
+    # per-cycle average over all windows (this is the R²=0.921 metric in the report)
+    if seg_all:
+        if st.button("Predict SOH — per-cycle (mean of all windows)", type="primary",
+                     use_container_width=True, key="btn_seg_cycle"):
+            try:
+                preds = [predict_soh_segment(w["v_start"], w["v_end"], w["soc_mid"]) * 100
+                         for w in seg_all]
+                soh_mean = float(np.mean(preds))
+                render_soh_result(soh_mean, rated_cap_s,
+                                  f"Segment PINN — per-cycle mean of {len(preds)} windows")
+                st.caption(f"Per-window spread: {np.min(preds):.1f}–{np.max(preds):.1f}%  "
+                           f"(std {np.std(preds):.1f}%p). Averaging windows is what gives the reported per-cycle accuracy.")
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+    if st.button("Predict SOH — this single window", use_container_width=True,
                  disabled=(seg_input is None), key="btn_seg"):
         try:
-            soh = predict_soh_segment(
-                seg_input["cap_ah"], seg_input["dv_dah"],
-                seg_input["soc_hi"], seg_input["soc_lo"],
-                rated_cap_s
-            )
-            render_soh_result(soh * 100, rated_cap_s, "Segment PINN (MAE ~1.1%)")
+            soh = predict_soh_segment(seg_input["v_start"], seg_input["v_end"], seg_input["soc_mid"])
+            render_soh_result(soh * 100, rated_cap_s, "Segment PINN (single 10% window)")
         except Exception as e:
             st.error(f"Error: {e}")
 

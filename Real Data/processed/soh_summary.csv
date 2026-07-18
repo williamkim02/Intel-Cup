@@ -1,0 +1,4 @@
+source,segment_SOH,measured_coulomb_SOH,gap_pp,n_windows
+packmean,94.0,95.9,1.9,20
+cell1,93.5,95.9,2.4,20
+cell2,93.8,95.9,2.1,20
