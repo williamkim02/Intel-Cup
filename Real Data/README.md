@@ -47,9 +47,17 @@ only the coulomb "truth" side does.
 - Per-window spread is real (79–99 %); the per-cycle mean is the reported metric — averaging windows is what stabilises it.
 - Coulomb "truth" assumes the cell's rated capacity is 2.0 Ah; confirm the nameplate for an exact error.
 
+## Any arbitrary 10% window → SOH  (`arbitrary_window_demo.py` → `figures/arbitrary_window_demo.png`)
+Given only a partial discharge (e.g. SOC 90→60%), any single 10% window inside it still yields an SOH:
+the 73–63% window alone reads **98.7%**. And the *same* 73–63% window tracks true SOH across the
+held-out cell B0018's whole life (67→93%) with **r = 0.98** — proof the window measures degradation,
+not a constant. Single-window absolute error is ±a few %p (voltage-offset bias between cells); averaging
+several windows tightens it.
+
 ## Reproduce
 ```bash
 python "Real Data/postprocess_and_check.py"     # writes processed/*.csv + soh_summary.csv
+python "Real Data/arbitrary_window_demo.py"     # arbitrary-window demo figure
 ```
 Or use the dashboard: `streamlit run app.py` → *SOH — Quick Segment* → Upload CSV →
 `Real Data/processed/real_packmean_model_input.csv`.
