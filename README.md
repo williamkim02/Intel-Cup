@@ -13,6 +13,8 @@ decision plus knee-point and remaining-useful-life views.
 
 > Dataset: NASA PCoE Li-ion Battery Aging (cells B0005/B0006/B0007 train, **B0018 held out**, leave-one-cell-out).
 
+> 📖 **[MODEL_A_TO_Z.md](MODEL_A_TO_Z.md)** — full A→Z walkthrough of the deployed model (problem → data → discarded methods → architecture → inference → deployment → validation → limits), written as a presentation guide.
+
 ---
 
 ## Quick start
