@@ -33,6 +33,7 @@ Intel-Cup/
 ├── app.py                     # Streamlit decision-support dashboard (deployed instrument)
 ├── pinn_model.py              # PINN model definition (shared by app + training)
 ├── knee_detector.py           # knee-point / lifetime-tracking logic (dashboard aux tab)
+├── ocv_soc.py                 # OCV→SOC estimate: SOC_mid from voltage (partial window, no full curve)
 ├── train_soh_universal.py     # trains the full-discharge (universal) PINN
 │                              #   (DEPLOYED ±10% segment PINN is trained in
 │                              #    "Discharge-based models/train_segment.py")
@@ -48,6 +49,7 @@ Intel-Cup/
 │   ├── soh_universal_model.pth    # full-discharge PINN
 │   ├── rul_model.pth              # remaining-useful-life
 │   ├── parking_model.pkl          # cold-weather / parking risk
+│   ├── ocv_soc_reference.csv      # voltage↔SOC reference (healthy NASA cycles) for OCV→SOC
 │   └── SVR_SVM/                   # SVR/SVM baselines (resistance & curve features)
 │
 ├── Discharge-based models/    # discharge + ±10% segment study + DEPLOYED segment trainer (§3.4.2 / §3.4.4)
@@ -75,7 +77,7 @@ Intel-Cup/
 
 | Model | Representation | Held-out B0018 | Notes |
 |---|---|---|---|
-| **Segment PINN** ★ | 10% discharge window (4 voltage feats) | **R² = 0.895 ± 0.013** (per-cycle ≈ 0.92) | deployed; fast + seed-robust + leakage-free |
+| **Segment PINN** ★ | 10% discharge window (4 voltage feats) | **R² = 0.895 ± 0.013** (per-cycle ≈ 0.92) | deployed; fast + seed-robust + leakage-free; SOC_mid from position **or** OCV→SOC (partial window, no full curve) |
 | Full-discharge PINN | capacity-normalised window feats | R² = 0.944 ± 0.005 | needs whole curve; capacity-informed |
 | Charge PINN | ICA (dV/dQ) + impedance | R² = 0.32 ± 0.27 | promising but seed-unstable, not deployed |
 | SVR / MLP | resistance / curve scalars | R² < 0 (resistance only) | baselines; impedance alone doesn't transfer |

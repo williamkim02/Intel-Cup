@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pinn_model import SOHCurvePINN, RULPredictor
 from knee_detector import KneeDetector
+from ocv_soc import voltage_to_soc
 
 ROOT             = os.path.dirname(os.path.abspath(__file__))
 MODEL_UNIVERSAL  = os.path.join(ROOT, "models", "soh_universal_model.pth")   # 100->60% 전체
@@ -100,9 +101,13 @@ WIN_SEG    = 13     # 13/128 ≈ 10% window
 STRIDE_SEG = 6      # 6/128  ≈ 5% stride
 
 
-def extract_segment_windows(df):
+def extract_segment_windows(df, soc_from_voltage=False):
     """V(t)/I(t) discharge CSV -> sliding 10% voltage windows.
-    Returns list of dicts: {soc_mid, v_start, v_end, dv}.  No capacity used."""
+    Returns list of dicts: {soc_mid, v_start, v_end, dv}.  No capacity used.
+
+    soc_from_voltage=False : SOC_mid = window position in the (assumed FULL) discharge.
+    soc_from_voltage=True  : SOC_mid = OCV->SOC estimate from the window voltage, so a
+                             SHORT PARTIAL window works without the full curve."""
     df = df.copy().sort_values("time").reset_index(drop=True)
     V  = df["voltage"].values.astype(float)
     if len(V) < WIN_SEG + 1:
@@ -113,8 +118,11 @@ def extract_segment_windows(df):
     wins = []
     for ws in range(0, N_TS_SEG - WIN_SEG + 1, STRIDE_SEG):
         we      = ws + WIN_SEG
-        soc_mid = 1.0 - (ws + we) / 2.0 / N_TS_SEG   # 1.0=start, 0.0=end
         v_s     = float(Vr[ws]); v_e = float(Vr[we - 1])
+        if soc_from_voltage:
+            soc_mid = float(voltage_to_soc((v_s + v_e) / 2.0))  # OCV->SOC, no full curve needed
+        else:
+            soc_mid = 1.0 - (ws + we) / 2.0 / N_TS_SEG          # 1.0=start, 0.0=end
         wins.append({
             "soc_mid": round(soc_mid, 3),
             "v_start": round(v_s, 4),
@@ -353,17 +361,32 @@ with tab2:
         )
 
     st.divider()
+    soc_src = st.radio(
+        "SOC_mid source",
+        ["Discharge position (needs full curve)",
+         "Estimate from voltage — OCV→SOC (partial window OK)"],
+        horizontal=True, key="soc_src",
+        help="OCV→SOC reads SOC_mid off the reference voltage↔SOC curve, so a short "
+             "partial-discharge window can be scored without the full discharge or any "
+             "capacity/rated value. Approximate (shifts with health/C-rate), but SOC_mid "
+             "is only a soft positional feature.",
+    )
+    use_ocv = soc_src.startswith("Estimate")
+
     mode_s = st.radio("Input method", ["Upload CSV", "Enter manually"], horizontal=True, key="mode_s")
 
     seg_input = None   # {v_start, v_end, soc_mid}
     seg_all   = None   # list of all windows (for per-cycle averaging)
 
     if mode_s == "Upload CSV":
-        st.markdown("Required columns: `time`(s)  `voltage`(V)  `current`(A)")
+        cols = "`time`(s)  `voltage`(V)  `current`(A)"
+        st.markdown(("Required columns: " + cols +
+                     ("  ·  a short partial discharge is fine (SOC from voltage)" if use_ocv
+                      else "  ·  should be a full 100→0% discharge (SOC from position)")))
         up_s = st.file_uploader("Upload discharge log", type=["csv"], key="up_seg")
         if up_s:
             df_raw_s = pd.read_csv(up_s)
-            wins = extract_segment_windows(df_raw_s)
+            wins = extract_segment_windows(df_raw_s, soc_from_voltage=use_ocv)
             if not wins:
                 st.warning("Not enough samples to form a 10% window.")
             else:
@@ -393,8 +416,13 @@ with tab2:
             v_end_in   = st.number_input("V_end (V)",   key="ve_in", min_value=0.0, max_value=5.0,
                                           value=3.80, step=0.01, format="%.3f")
         with sc2:
-            soc_mid_in = st.slider("Window position SOC_mid (1.0=start → 0.0=end)",
-                                    0.0, 1.0, 0.5, step=0.05, key="socmid_in")
+            if use_ocv:
+                soc_mid_in = float(voltage_to_soc((v_start_in + v_end_in) / 2.0))
+                st.metric("SOC_mid (estimated from voltage)", f"{soc_mid_in:.2f}")
+                st.caption("OCV→SOC — no full curve or capacity needed.")
+            else:
+                soc_mid_in = st.slider("Window position SOC_mid (1.0=start → 0.0=end)",
+                                        0.0, 1.0, 0.5, step=0.05, key="socmid_in")
         if v_end_in > v_start_in:
             st.error("V_end should be ≤ V_start on a discharge window.")
         else:
