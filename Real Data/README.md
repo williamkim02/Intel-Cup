@@ -54,10 +54,18 @@ held-out cell B0018's whole life (67→93%) with **r = 0.98** — proof the wind
 not a constant. Single-window absolute error is ±a few %p (voltage-offset bias between cells); averaging
 several windows tightens it.
 
+## Partial-slice screening — a few minutes → SOH  (`partial_slice_demo.py` → `figures/partial_slice_demo.png`)
+The real deployment scenario: use **only a short raw slice**, not the full discharge. Taking any
+**5-min slice** (≈8% SOC, ~9% of the 56.6-min discharge), denoising just that chunk, and estimating
+SOC_mid from voltage (OCV→SOC), the deployed PINN reads **93.0–93.6% SOH** — within ~2–3 %p of the
+coulomb truth 95.9%, and consistent whichever 5 minutes you pick. **No full curve, no capacity, no
+rated value.** (10-min slices → ~92%.)
+
 ## Reproduce
 ```bash
 python "Real Data/postprocess_and_check.py"     # writes processed/*.csv + soh_summary.csv
 python "Real Data/arbitrary_window_demo.py"     # arbitrary-window demo figure
+python "Real Data/partial_slice_demo.py"        # few-minutes raw slice -> SOH figure
 ```
 Or use the dashboard: `streamlit run app.py` → *SOH — Quick Segment* → Upload CSV →
 `Real Data/processed/real_packmean_model_input.csv`.
